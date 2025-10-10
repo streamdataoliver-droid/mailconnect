@@ -4,7 +4,6 @@ import base64
 import time
 import re
 import json
-import random
 from email.mime.text import MIMEText
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -14,327 +13,165 @@ from googleapiclient.discovery import build
 # Streamlit Page Setup
 # ========================================
 st.set_page_config(page_title="Gmail Mail Merge", layout="wide")
-st.title("📧 Gmail Mail Merge Tool (New + Follow-up + Draft Mode)")
+st.title("📧 Gmail Mail Merge Tool")
 
 # ========================================
-# Gmail API Setup
+# Helper Functions
 # ========================================
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.labels",
-    "https://www.googleapis.com/auth/gmail.compose",
-]
-
-CLIENT_CONFIG = {
-    "web": {
-        "client_id": st.secrets["gmail"]["client_id"],
-        "client_secret": st.secrets["gmail"]["client_secret"],
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "redirect_uris": [st.secrets["gmail"]["redirect_uri"]],
-    }
-}
-
-# ========================================
-# Smart Email Extractor
-# ========================================
-EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
-
-def extract_email(value: str):
-    if not value:
-        return None
-    match = EMAIL_REGEX.search(str(value))
+def extract_email(address):
+    """Extract clean email address from string"""
+    match = re.search(r'[\w\.-]+@[\w\.-]+', str(address))
     return match.group(0) if match else None
 
-# ========================================
-# Gmail Label Helper
-# ========================================
-def get_or_create_label(service, label_name="Mail Merge Sent"):
-    try:
-        labels = service.users().labels().list(userId="me").execute().get("labels", [])
-        for label in labels:
-            if label["name"].lower() == label_name.lower():
-                return label["id"]
+def create_message(sender, to, subject, body):
+    """Create MIME message for Gmail"""
+    message = MIMEText(body, "html")
+    message["to"] = to
+    message["from"] = sender
+    message["subject"] = subject
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return {"raw": raw_message}
 
-        label_obj = {
-            "name": label_name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        }
-        created_label = service.users().labels().create(userId="me", body=label_obj).execute()
-        return created_label["id"]
+def get_or_create_label(service, label_name):
+    """Find or create a Gmail label"""
+    labels = service.users().labels().list(userId="me").execute().get("labels", [])
+    for label in labels:
+        if label["name"].lower() == label_name.lower():
+            return label["id"]
 
-    except Exception as e:
-        st.warning(f"Could not get/create label: {e}")
-        return None
-
-# ========================================
-# Bold + Link Converter
-# ========================================
-def convert_bold(text):
-    if not text:
-        return ""
-    text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(
-        r"\[(.*?)\]\((https?://[^\s)]+)\)",
-        r'<a href="\2" style="color:#1a73e8; text-decoration:underline;" target="_blank">\1</a>',
-        text,
-    )
-    text = text.replace("\n", "<br>").replace("  ", "&nbsp;&nbsp;")
-    return f"""
-    <html>
-        <body style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6;">
-            {text}
-        </body>
-    </html>
-    """
-
-# ========================================
-# OAuth Flow
-# ========================================
-if "creds" not in st.session_state:
-    st.session_state["creds"] = None
-
-if st.session_state["creds"]:
-    creds = Credentials.from_authorized_user_info(
-        json.loads(st.session_state["creds"]), SCOPES
-    )
-else:
-    code = st.experimental_get_query_params().get("code", None)
-    if code:
-        flow = Flow.from_client_config(CLIENT_CONFIG, scopes=SCOPES)
-        flow.redirect_uri = st.secrets["gmail"]["redirect_uri"]
-        flow.fetch_token(code=code[0])
-        creds = flow.credentials
-        st.session_state["creds"] = creds.to_json()
-        st.rerun()
-    else:
-        flow = Flow.from_client_config(CLIENT_CONFIG, scopes=SCOPES)
-        flow.redirect_uri = st.secrets["gmail"]["redirect_uri"]
-        auth_url, _ = flow.authorization_url(
-            prompt="consent", access_type="offline", include_granted_scopes="true"
+    # Create if not found
+    label = (
+        service.users()
+        .labels()
+        .create(
+            userId="me",
+            body={"name": label_name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
         )
-        st.markdown(
-            f"### 🔑 Please [authorize the app]({auth_url}) to send emails using your Gmail account."
-        )
-        st.stop()
-
-# Build Gmail API client
-creds = Credentials.from_authorized_user_info(json.loads(st.session_state["creds"]), SCOPES)
-service = build("gmail", "v1", credentials=creds)
+        .execute()
+    )
+    return label["id"]
 
 # ========================================
-# Upload Recipients
+# Step 1: Upload CSV
 # ========================================
-st.header("📤 Upload Recipient List")
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+st.header("📤 Upload Recipients CSV")
+uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
 
 if uploaded_file:
-    if uploaded_file.name.endswith("csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
-
-    st.write("✅ Preview of uploaded data:")
+    df = pd.read_csv(uploaded_file)
+    st.success(f"✅ File uploaded successfully with {len(df)} rows.")
     st.dataframe(df.head())
-    st.info("📌 Include 'ThreadId' and 'RfcMessageId' columns for follow-ups if needed.")
 
     # ========================================
-    # Email Template
+    # Step 2: Compose Email
     # ========================================
-    st.header("✍️ Compose Your Email")
-    subject_template = st.text_input("Subject", "Hello {Name}")
+    st.header("📝 Compose Email")
+    subject_template = st.text_input("Subject", "Hello {{Name}}")
     body_template = st.text_area(
-        "Body (supports **bold**, [link](https://example.com), and line breaks)",
-        """Dear {Name},
-
-Welcome to our **Mail Merge App** demo.
-
-You can add links like [Visit Google](https://google.com)
-and preserve formatting exactly.
-
-Thanks,  
-**Your Company**""",
-        height=250,
+        "Body (HTML supported)",
+        "Dear {{Name}},<br><br>This is a test mail merge message.<br><br>Best regards,<br>Your Company"
     )
 
     # ========================================
-    # Preview Section
+    # Step 3: Gmail Auth
     # ========================================
-    st.subheader("👁️ Preview Email")
-    if not df.empty:
-        recipient_options = df["Email"].astype(str).tolist()
-        selected_email = st.selectbox("Select recipient to preview", recipient_options)
-        try:
-            preview_row = df[df["Email"] == selected_email].iloc[0]
-            preview_subject = subject_template.format(**preview_row)
-            preview_body = body_template.format(**preview_row)
-            preview_html = convert_bold(preview_body)
-            st.markdown(f"**Subject:** {preview_subject}")
-            st.markdown("---")
-            st.markdown(preview_html, unsafe_allow_html=True)
-        except KeyError as e:
-            st.error(f"⚠️ Missing column in data: {e}")
+    st.header("🔐 Connect Your Gmail Account")
+
+    client_secret_file = st.file_uploader("Upload your Gmail API credentials (client_secret.json)", type=["json"])
+    token_file = "token.json"
+
+    creds = None
+    if client_secret_file:
+        creds_data = json.load(client_secret_file)
+        st.info("📂 Credentials file loaded.")
+
+        flow = Flow.from_client_config(
+            creds_data,
+            scopes=["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/gmail.compose"],
+            redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+        )
+
+        auth_url, _ = flow.authorization_url(prompt="consent")
+        st.markdown(f"[Click here to authorize Gmail access]({auth_url})")
+
+        auth_code = st.text_input("Enter the authorization code from Gmail:")
+
+        if auth_code:
+            flow.fetch_token(code=auth_code)
+            creds = flow.credentials
+            with open(token_file, "w") as token:
+                token.write(creds.to_json())
+            st.success("✅ Gmail authorized successfully!")
 
     # ========================================
-    # Label & Delay Options
+    # Step 4: Label and Timing
     # ========================================
     st.header("🏷️ Label & Timing Options")
-    label_name = st.text_input("Gmail label to apply (new emails only)", value="Mail Merge Sent")
-    delay = st.number_input("Delay between emails (seconds)", min_value=0, max_value=90, value=60, step=5)
+    label_name = st.text_input("Gmail label to apply (new emails only)", "Mail Merge Sent")
+    delay_seconds = st.number_input("Delay between emails (seconds)", min_value=0, value=60, step=5)
 
-    # ========================================
-    # Send Mode (New / Follow-up / Draft)
-    # ========================================
+    # Add new send mode
     send_mode = st.radio(
         "Choose sending mode",
         ["🆕 New Email", "↩️ Follow-up (Reply)", "💾 Save as Draft"]
     )
 
     # ========================================
-    # Send or Draft Button
+    # Step 5: Send / Draft Emails
     # ========================================
-    if st.button("🚀 Process Emails"):
-        label_id = get_or_create_label(service, label_name)
-        sent_count = 0
-        skipped, errors = [], []
+    if creds and st.button("🚀 Send Emails"):
+        service = build("gmail", "v1", credentials=creds)
+        sent_count, skipped, errors = 0, [], []
 
         with st.spinner("📨 Processing emails... please wait."):
-
-            if "ThreadId" not in df.columns:
-                df["ThreadId"] = None
-            if "RfcMessageId" not in df.columns:
-                df["RfcMessageId"] = None
+            label_id = get_or_create_label(service, label_name)
 
             for idx, row in df.iterrows():
-                to_addr = extract_email(str(row.get("Email", "")).strip())
-                if not to_addr:
-                    skipped.append(row.get("Email"))
-                    continue
-
                 try:
-                    subject = subject_template.format(**row)
-                    body_html = convert_bold(body_template.format(**row))
+                    to_addr = extract_email(row.get("Email", ""))
+                    if not to_addr:
+                        skipped.append(idx)
+                        continue
 
-                    message = MIMEText(body_html, "html")
-                    message["To"] = to_addr
-                    message["Subject"] = subject
+                    # Render subject and body templates
+                    subject = subject_template
+                    body = body_template
+                    for col in df.columns:
+                        subject = subject.replace(f"{{{{{col}}}}}", str(row[col]))
+                        body = body.replace(f"{{{{{col}}}}}", str(row[col]))
 
-                    msg_body = {}
+                    msg_body = create_message("me", to_addr, subject, body)
 
-                    # ===== Follow-up (Reply) mode =====
-                    if send_mode == "↩️ Follow-up (Reply)" and "ThreadId" in row and "RfcMessageId" in row:
-                        thread_id = str(row["ThreadId"]).strip()
-                        rfc_id = str(row["RfcMessageId"]).strip()
-
-                        if thread_id and thread_id.lower() != "nan" and rfc_id:
-                            message["In-Reply-To"] = rfc_id
-                            message["References"] = rfc_id
-                            raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-                            msg_body = {"raw": raw, "threadId": thread_id}
-                        else:
-                            raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-                            msg_body = {"raw": raw}
-
-                    # ===== New Email Mode =====
-                    else:
-                        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-                        msg_body = {"raw": raw}
-
-                    # ===============================
-                    # ✉️ Send or Save as Draft
-                    # ===============================
+                    # 🆕 New Email or ↩️ Follow-up or 💾 Save as Draft
                     if send_mode == "💾 Save as Draft":
                         draft = service.users().drafts().create(userId="me", body={"message": msg_body}).execute()
-                        sent_msg = draft.get("message", {})
                         st.info(f"📝 Draft saved for {to_addr}")
+                        sent_count += 1
+                    elif send_mode == "↩️ Follow-up (Reply)":
+                        thread_id = row.get("ThreadId", "")
+                        if not thread_id:
+                            skipped.append(idx)
+                            continue
+                        msg_body["threadId"] = thread_id
+                        sent_msg = service.users().messages().send(userId="me", body=msg_body).execute()
+                        st.success(f"↩️ Follow-up sent to {to_addr}")
+                        sent_count += 1
                     else:
                         sent_msg = service.users().messages().send(userId="me", body=msg_body).execute()
-
-                    # ✅ Reliable RFC Message-ID Fetch
-                    message_id_header = None
-                    for attempt in range(8):
-                        time.sleep(random.uniform(2, 4))
-                        try:
-                            msg_detail = service.users().messages().get(
-                                userId="me",
-                                id=sent_msg["id"],
-                                format="metadata",
-                                metadataHeaders=["Message-ID"],
-                            ).execute()
-
-                            message_id_header = next(
-                                (h["value"] for h in msg_detail.get("payload", {}).get("headers", [])
-                                 if h["name"].lower() == "message-id"),
-                                None,
-                            )
-
-                            if message_id_header:
-                                break
-
-                            thread_messages = service.users().messages().list(
-                                userId="me",
-                                q=f"threadid:{sent_msg['threadId']}",
-                                maxResults=1
-                            ).execute().get("messages", [])
-                            if thread_messages:
-                                m_id = thread_messages[0]["id"]
-                                msg_info = service.users().messages().get(
-                                    userId="me",
-                                    id=m_id,
-                                    format="metadata",
-                                    metadataHeaders=["Message-ID"],
-                                ).execute()
-                                message_id_header = next(
-                                    (h["value"] for h in msg_info.get("payload", {}).get("headers", [])
-                                     if h["name"].lower() == "message-id"),
-                                    None,
-                                )
-                                if message_id_header:
-                                    break
-
-                        except Exception as e:
-                            st.warning(f"Attempt {attempt+1} failed to fetch Message-ID: {e}")
-
-                    if not message_id_header:
-                        st.warning(f"⚠️ Message-ID not found for {to_addr}.")
-
-                    if send_mode == "🆕 New Email" and label_id:
-                        time.sleep(1)
                         service.users().messages().modify(
-                            userId="me",
-                            id=sent_msg["id"],
-                            body={"addLabelIds": [label_id]},
+                            userId="me", id=sent_msg["id"], body={"addLabelIds": [label_id]}
                         ).execute()
+                        st.success(f"✅ Mail sent to {to_addr}")
+                        sent_count += 1
 
-                    df.loc[idx, "ThreadId"] = sent_msg.get("threadId", "")
-                    df.loc[idx, "RfcMessageId"] = message_id_header or ""
-
-                    sent_count += 1
-                    if send_mode != "💾 Save as Draft":
-                        time.sleep(delay)
+                    time.sleep(delay_seconds)
 
                 except Exception as e:
-                    errors.append((to_addr, str(e)))
+                    errors.append((idx, str(e)))
+                    continue
 
-        # ========================================
-        # Summary + CSV Export
-        # ========================================
-        if send_mode == "💾 Save as Draft":
-            st.success(f"✅ Successfully created {sent_count} drafts.")
-        else:
-            st.success(f"✅ Successfully sent {sent_count} emails.")
-
+        st.success(f"🎉 Completed — {sent_count} processed successfully.")
         if skipped:
-            st.warning(f"⚠️ Skipped {len(skipped)} invalid emails: {skipped}")
+            st.warning(f"⏭️ Skipped {len(skipped)} entries (missing email or thread).")
         if errors:
-            st.error(f"❌ Failed to process {len(errors)} emails: {errors}")
-
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Updated CSV (with ThreadId + RfcMessageId)",
-            csv,
-            "updated_mailmerge.csv",
-            "text/csv",
-        )
+            st.error(f"⚠️ {len(errors)} errors encountered. See console logs for details.")

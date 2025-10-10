@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 # Streamlit Page Setup
 # ========================================
 st.set_page_config(page_title="Gmail Mail Merge", layout="wide")
-st.title("📧 Gmail Mail Merge Tool (with Follow-up Replies)")
+st.title("📧 Gmail Mail Merge Tool (New + Follow-up + Draft Mode)")
 
 # ========================================
 # Gmail API Setup
@@ -23,6 +23,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.labels",
+    "https://www.googleapis.com/auth/gmail.compose",
 ]
 
 CLIENT_CONFIG = {
@@ -184,18 +185,23 @@ Thanks,
     delay = st.number_input("Delay between emails (seconds)", min_value=0, max_value=90, value=60, step=5)
 
     # ========================================
-    # Send Mode
+    # Send Mode (New / Follow-up / Draft)
     # ========================================
-    send_mode = st.radio("Choose sending mode", ["🆕 New Email", "↩️ Follow-up (Reply)"])
+    send_mode = st.radio(
+        "Choose sending mode",
+        ["🆕 New Email", "↩️ Follow-up (Reply)", "💾 Save as Draft"]
+    )
 
-    if st.button("🚀 Send Emails"):
+    # ========================================
+    # Send or Draft Button
+    # ========================================
+    if st.button("🚀 Process Emails"):
         label_id = get_or_create_label(service, label_name)
         sent_count = 0
         skipped, errors = [], []
 
-        with st.spinner("📨 Sending emails... please wait."):
+        with st.spinner("📨 Processing emails... please wait."):
 
-            # Ensure columns exist
             if "ThreadId" not in df.columns:
                 df["ThreadId"] = None
             if "RfcMessageId" not in df.columns:
@@ -236,13 +242,20 @@ Thanks,
                         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
                         msg_body = {"raw": raw}
 
-                    # Send the email
-                    sent_msg = service.users().messages().send(userId="me", body=msg_body).execute()
+                    # ===============================
+                    # ✉️ Send or Save as Draft
+                    # ===============================
+                    if send_mode == "💾 Save as Draft":
+                        draft = service.users().drafts().create(userId="me", body={"message": msg_body}).execute()
+                        sent_msg = draft.get("message", {})
+                        st.info(f"📝 Draft saved for {to_addr}")
+                    else:
+                        sent_msg = service.users().messages().send(userId="me", body=msg_body).execute()
 
-                    # ✅ FINAL FIX: Reliable RFC Message-ID Fetch
+                    # ✅ Reliable RFC Message-ID Fetch
                     message_id_header = None
                     for attempt in range(8):
-                        time.sleep(random.uniform(2, 4))  # wait longer
+                        time.sleep(random.uniform(2, 4))
                         try:
                             msg_detail = service.users().messages().get(
                                 userId="me",
@@ -260,7 +273,6 @@ Thanks,
                             if message_id_header:
                                 break
 
-                            # 🔁 fallback: search by thread if still missing
                             thread_messages = service.users().messages().list(
                                 userId="me",
                                 q=f"threadid:{sent_msg['threadId']}",
@@ -286,9 +298,8 @@ Thanks,
                             st.warning(f"Attempt {attempt+1} failed to fetch Message-ID: {e}")
 
                     if not message_id_header:
-                        st.warning(f"⚠️ Message-ID not found for {to_addr}. Try re-fetching later.")
+                        st.warning(f"⚠️ Message-ID not found for {to_addr}.")
 
-                    # Apply label for new emails only
                     if send_mode == "🆕 New Email" and label_id:
                         time.sleep(1)
                         service.users().messages().modify(
@@ -297,12 +308,12 @@ Thanks,
                             body={"addLabelIds": [label_id]},
                         ).execute()
 
-                    # Save data back to DataFrame
                     df.loc[idx, "ThreadId"] = sent_msg.get("threadId", "")
                     df.loc[idx, "RfcMessageId"] = message_id_header or ""
 
                     sent_count += 1
-                    time.sleep(delay)
+                    if send_mode != "💾 Save as Draft":
+                        time.sleep(delay)
 
                 except Exception as e:
                     errors.append((to_addr, str(e)))
@@ -310,11 +321,15 @@ Thanks,
         # ========================================
         # Summary + CSV Export
         # ========================================
-        st.success(f"✅ Successfully sent {sent_count} emails.")
+        if send_mode == "💾 Save as Draft":
+            st.success(f"✅ Successfully created {sent_count} drafts.")
+        else:
+            st.success(f"✅ Successfully sent {sent_count} emails.")
+
         if skipped:
             st.warning(f"⚠️ Skipped {len(skipped)} invalid emails: {skipped}")
         if errors:
-            st.error(f"❌ Failed to send {len(errors)} emails: {errors}")
+            st.error(f"❌ Failed to process {len(errors)} emails: {errors}")
 
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(

@@ -1,4 +1,4 @@
-# ======================================== 
+# =========================================
 # Gmail Mail Merge Tool - Modern UI Edition
 # (Encoding Fix + Draft Default 110 + Reply Draft Support + ETA)
 # ========================================
